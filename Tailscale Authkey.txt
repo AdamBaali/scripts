@@ -1,0 +1,112 @@
+﻿#!/bin/bash
+
+# === CONFIG ===
+CLIENT_ID="$4"                # Jamf parameter 4 (OAuth Client ID)
+CLIENT_SECRET="$5"            # Jamf parameter 5 (OAuth Client Secret)
+TAGS="tag:vzw-enforced"       # Tailscale device tag
+HOSTNAME=$(scutil --get ComputerName)
+TAILSCALE="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+# ==============
+
+# === HELPERS ===
+log() {
+  echo "[tailscale-jamf] $1"
+}
+
+kill_chrome() {
+  if pgrep -x "Google Chrome" >/dev/null; then
+    log "Killing Chrome to suppress auth prompt"
+    pkill -x "Google Chrome"
+    sleep 1
+  fi
+}
+# ===============
+
+# === STEP 0: LaunchServices cache cleanup (avoids reboot) ===
+log "Waiting before clearing LaunchServices cache..."
+sleep 10
+
+log "Clearing LaunchServices cache..."
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -kill -r -domain local -domain system -domain user
+log "LaunchServices cache cleared"
+
+sleep 10
+
+# === STEP 1: Launch Tailscale GUI ===
+log "Launching Tailscale app..."
+open -g -a "/Applications/Tailscale.app"
+sleep 3
+
+# === STEP 2: Get OAuth access token ===
+log "Requesting access token..."
+ACCESS_TOKEN=$(
+  curl -s --max-time 10 -X POST https://api.tailscale.com/api/v2/oauth/token \
+    -d "client_id=$CLIENT_ID" \
+    -d "client_secret=$CLIENT_SECRET" |
+  grep -o '"access_token":"[^"]*"' | cut -d':' -f2 | tr -d '"'
+)
+
+if [[ -z "$ACCESS_TOKEN" ]]; then
+  log "Failed to retrieve access token"
+  exit 1
+fi
+log "Access token obtained."
+
+# === STEP 3: Generate ephemeral auth key ===
+log "Generating ephemeral auth key..."
+AUTH_KEY=$(
+  curl -s --max-time 10 -X POST https://api.tailscale.com/api/v2/tailnet/-/keys \
+    -H "Authorization: Bearer $ACCESS_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true,\"preauthorized\":true,\"tags\":[\"$TAGS\"]}}},\"description\":\"Jamf Enrollment Key\"}" |
+  grep -o '"key":"tskey-[^"]*"' | cut -d':' -f2 | tr -d '"'
+)
+
+if [[ -z "$AUTH_KEY" ]]; then
+  log "Failed to generate auth key"
+  exit 1
+fi
+log "Auth key generated."
+
+# === STEP 4: Wait for daemon ===
+log "Waiting for Tailscale daemon..."
+for i in {1..10}; do
+  if $TAILSCALE status >/dev/null 2>&1; then
+    log "Tailscale daemon is ready"
+    break
+  fi
+  sleep 1
+done
+
+if ! $TAILSCALE status >/dev/null 2>&1; then
+  log "Tailscale daemon not ready — exiting"
+  exit 1
+fi
+
+# === STEP 5: Reset before enrollment ===
+log "Resetting Tailscale state before enrollment..."
+$TAILSCALE up --reset
+sleep 2
+kill_chrome
+
+# === STEP 6: Run Tailscale up ===
+log "Running 'tailscale up' with auth key..."
+$TAILSCALE up \
+  --auth-key="$AUTH_KEY" \
+  --advertise-tags="$TAGS" \
+  --hostname="$HOSTNAME"
+
+if [[ $? -eq 0 ]]; then
+  log "Tailscale enrolled successfully."
+else
+  log "Tailscale up failed"
+  exit 1
+fi
+
+# === STEP 7: Confirm status ===
+log "Tailscale status:"
+$TAILSCALE status
+
+log "Script completed successfully."
+exit 0
